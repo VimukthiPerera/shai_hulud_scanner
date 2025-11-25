@@ -75,44 +75,60 @@ def parse_library_line(line: str) -> Optional[tuple[str, str]]:
     return (lib_name, lib_version)
 
 
-def load_libraries_from_file(file_path: str) -> set[tuple[str, str]]:
+def load_libraries_from_file(file_path: str) -> tuple[set[tuple[str, str]], list[tuple[str, str, str]]]:
     """
     Load libraries from a single file.
     Supports format: package-name-version (one per line)
-    Returns a set for deduplication.
+    Returns (unique_set, duplicates_list) where duplicates_list contains (lib_name, lib_version, source_file).
     """
     libraries_set: set[tuple[str, str]] = set()
+    duplicates: list[tuple[str, str, str]] = []
+    source_name = Path(file_path).name
 
     with open(file_path, 'r') as f:
         for line in f:
             parsed = parse_library_line(line)
             if parsed:
-                libraries_set.add(parsed)
+                if parsed in libraries_set:
+                    duplicates.append((parsed[0], parsed[1], source_name))
+                else:
+                    libraries_set.add(parsed)
 
-    return libraries_set
+    return libraries_set, duplicates
 
 
-def load_libraries_from_directory(lists_dir: Path) -> list[tuple[str, str]]:
+def load_libraries_from_directory(lists_dir: Path) -> tuple[list[tuple[str, str]], list[tuple[str, str, str]]]:
     """
     Load libraries from all .txt files in a directory.
     Automatically deduplicates and sorts the list.
+    Returns (unique_libraries, all_duplicates) where all_duplicates tracks items removed.
     """
     libraries_set: set[tuple[str, str]] = set()
+    all_duplicates: list[tuple[str, str, str]] = []
 
     txt_files = sorted(lists_dir.glob('*.txt'))
     if not txt_files:
-        return []
+        return [], []
 
     log_info(f"Loading libraries from {lists_dir}")
     for txt_file in txt_files:
-        file_libs = load_libraries_from_file(str(txt_file))
+        file_libs, file_dups = load_libraries_from_file(str(txt_file))
         log_info(f"  - {txt_file.name}: {len(file_libs)} entries")
-        libraries_set.update(file_libs)
+
+        # Track duplicates within the file
+        all_duplicates.extend(file_dups)
+
+        # Track cross-file duplicates
+        for lib in file_libs:
+            if lib in libraries_set:
+                all_duplicates.append((lib[0], lib[1], txt_file.name))
+            else:
+                libraries_set.add(lib)
 
     # Sort by library name, then by version
     libraries = sorted(libraries_set, key=lambda x: (x[0].lower(), x[1]))
 
-    return libraries
+    return libraries, all_duplicates
 
 
 def write_combined_list(libraries: list[tuple[str, str]], output_path: str):
@@ -126,6 +142,24 @@ def write_combined_list(libraries: list[tuple[str, str]], output_path: str):
         f.write("#\n")
         for lib_name, lib_version in libraries:
             f.write(f"{lib_name}-{lib_version}\n")
+
+
+def write_duplicates_list(duplicates: list[tuple[str, str, str]], output_path: str):
+    """
+    Write the list of duplicate entries that were removed during deduplication.
+    Each entry includes the source file where the duplicate was found.
+    """
+    with open(output_path, 'w') as f:
+        f.write(f"# Duplicate entries removed during deduplication\n")
+        f.write(f"# Generated: {datetime.now(timezone.utc).isoformat()}\n")
+        f.write(f"# Total duplicates removed: {len(duplicates)}\n")
+        f.write("#\n")
+        f.write("# Format: library-version (source_file)\n")
+        f.write("#\n")
+        # Sort by library name, then version, then source file
+        sorted_dups = sorted(duplicates, key=lambda x: (x[0].lower(), x[1], x[2]))
+        for lib_name, lib_version, source_file in sorted_dups:
+            f.write(f"{lib_name}-{lib_version} ({source_file})\n")
 
 
 def write_output(output_file: str, scanner: GitHubScanner, libraries_count: int):
@@ -153,6 +187,7 @@ def get_output_paths(outputs_dir: Path, org: str) -> dict:
         'results': f"{base}.json",
         'findings': f"{base}.findings.json",
         'libraries': f"{base}.libraries.txt",
+        'duplicates': f"{base}.duplicates.txt",
         'state': f"{base}.json.state",
         'branches': f"{base}.branches.json",
     }
@@ -179,12 +214,14 @@ async def async_main(args: argparse.Namespace) -> int:
         return 1
 
     # Load libraries from lists directory
-    libraries = load_libraries_from_directory(lists_dir)
+    libraries, duplicates = load_libraries_from_directory(lists_dir)
     if not libraries:
         log_error("No libraries found in lists/ directory")
         return 1
 
     log_info(f"Loaded {len(libraries)} unique libraries (deduplicated and sorted)")
+    if duplicates:
+        log_info(f"Removed {len(duplicates)} duplicate entries")
 
     # Get output paths
     paths = get_output_paths(outputs_dir, args.org)
@@ -193,6 +230,11 @@ async def async_main(args: argparse.Namespace) -> int:
     # Write combined list to file for reference
     write_combined_list(libraries, paths['libraries'])
     log_info(f"Combined library list written to: {paths['libraries']}")
+
+    # Write duplicates file if any duplicates were found
+    if duplicates:
+        write_duplicates_list(duplicates, paths['duplicates'])
+        log_info(f"Duplicates list written to: {paths['duplicates']}")
 
     # Branch scanning mode
     if args.scan_branches:
