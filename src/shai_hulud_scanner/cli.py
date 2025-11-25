@@ -448,8 +448,8 @@ def main() -> int:
     parser.add_argument(
         '-c', '--concurrency',
         type=int,
-        default=10,
-        help='Number of parallel searches (default: 10)'
+        default=1,
+        help='Number of parallel searches (default: 1)'
     )
     parser.add_argument(
         '-d', '--debug',

@@ -6,6 +6,7 @@ import asyncio
 import json
 import sys
 import base64
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Callable
@@ -39,6 +40,9 @@ class GitHubScanner:
         self.seen_detections: set[str] = set()
         # Track all findings (including non-matching versions) for detailed report
         self.all_findings: list[LibraryFinding] = []
+        # Global rate limit handling - when one task hits rate limit, all wait
+        self._rate_limit_lock = asyncio.Lock()
+        self._rate_limit_until: float = 0
 
     def _get_state_file(self) -> str:
         """Get the state file path based on output file."""
@@ -283,7 +287,17 @@ class GitHubScanner:
             log_debug(f"Skipping already scanned: {lib_key}")
             return []
 
-        async with self.semaphore:
+        # Check if we're in a rate limit window before acquiring semaphore
+        now = time.time()
+        if now < self._rate_limit_until:
+            wait_time = self._rate_limit_until - now
+            if wait_time > 1:  # Only log if significant wait
+                log_debug(f"Waiting {wait_time:.0f}s for rate limit before {lib_key}")
+            await asyncio.sleep(wait_time)
+
+        await self.semaphore.acquire()
+        semaphore_released = False
+        try:
             log_progress(index, total, f"Scanning: {lib_key}")
 
             search_query = (
@@ -313,12 +327,33 @@ class GitHubScanner:
                     log_debug(f"API error: {error_msg or stdout_msg}")
                     # Check for various rate limit error patterns
                     if 'rate limit' in combined_error or 'rate_limit' in combined_error or 'ratelimit' in combined_error:
-                        print(
-                            f"{Colors.YELLOW}[RATE LIMITED]{Colors.NC} "
-                            f"{lib_key} - waiting 60s",
-                            file=sys.stderr
-                        )
-                        await asyncio.sleep(60)
+                        # Release semaphore before handling rate limit
+                        self.semaphore.release()
+                        semaphore_released = True
+
+                        # Use global rate limit handling to coordinate all tasks
+                        async with self._rate_limit_lock:
+                            now = time.time()
+                            if now < self._rate_limit_until:
+                                # Another task already set the wait time, just wait the remaining
+                                wait_time = self._rate_limit_until - now
+                                print(
+                                    f"{Colors.YELLOW}[RATE LIMITED]{Colors.NC} "
+                                    f"{lib_key} - waiting {wait_time:.0f}s (already scheduled)",
+                                    file=sys.stderr
+                                )
+                            else:
+                                # First task to hit rate limit, set the global wait time
+                                wait_time = 60
+                                self._rate_limit_until = now + wait_time
+                                print(
+                                    f"{Colors.YELLOW}[RATE LIMITED]{Colors.NC} "
+                                    f"{lib_key} - waiting {wait_time}s",
+                                    file=sys.stderr
+                                )
+
+                        await asyncio.sleep(wait_time)
+                        # Retry without holding semaphore (will reacquire at start)
                         return await self.search_library(lib_name, lib_version, index, total)
                     return []
 
@@ -420,11 +455,14 @@ class GitHubScanner:
                     file=sys.stderr
                 )
                 return []
+        finally:
+            if not semaphore_released:
+                self.semaphore.release()
 
     async def scan_libraries(
         self, libraries: list[tuple[str, str]]
     ) -> list[SearchResult]:
-        """Scan all libraries concurrently with real-time output."""
+        """Scan all libraries with controlled concurrency."""
         total = len(libraries)
 
         # Initialize scan state
@@ -438,12 +476,21 @@ class GitHubScanner:
                 updated_at=datetime.now(timezone.utc).isoformat()
             )
 
-        tasks = [
-            self.search_library(name, version, idx + 1, total)
-            for idx, (name, version) in enumerate(libraries)
-        ]
+        # For concurrency=1, process strictly sequentially (no batching)
+        if self.concurrency == 1:
+            for idx, (name, version) in enumerate(libraries):
+                await self.search_library(name, version, idx + 1, total)
+        else:
+            # Process in batches to avoid creating too many pending coroutines
+            batch_size = self.concurrency * 2
 
-        await asyncio.gather(*tasks)
+            for i in range(0, len(libraries), batch_size):
+                batch = libraries[i:i + batch_size]
+                tasks = [
+                    self.search_library(name, version, i + idx + 1, total)
+                    for idx, (name, version) in enumerate(batch)
+                ]
+                await asyncio.gather(*tasks)
 
         # Return all results (including resumed ones)
         return self.results
