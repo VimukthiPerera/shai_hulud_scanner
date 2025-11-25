@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+import base64
+from typing import Optional
 
 from .models import SearchResult, AffectedRepository
 from .output import Colors, log_progress, log_detection, log_debug
@@ -20,10 +22,13 @@ class GitHubScanner:
         self.results_lock = asyncio.Lock()
         self.detection_count = 0
 
-    async def _fetch_matched_lines(
+    async def _fetch_and_verify(
         self, repo: str, file_path: str, lib_name: str, lib_version: str
-    ) -> list[str]:
-        """Fetch the actual file content and extract matched lines."""
+    ) -> Optional[list[tuple[int, str]]]:
+        """
+        Fetch file content, parse JSON, and verify exact package match.
+        Returns list of (line_number, line_content) if verified, None if not a real match.
+        """
         try:
             proc = await asyncio.create_subprocess_exec(
                 'gh', 'api',
@@ -35,19 +40,92 @@ class GitHubScanner:
             stdout, _ = await proc.communicate()
 
             if proc.returncode != 0:
-                return []
+                return None
 
-            import base64
             content = base64.b64decode(stdout.decode().strip()).decode('utf-8')
 
-            matched = []
-            for line in content.split('\n'):
-                if lib_name in line and lib_version in line:
-                    matched.append(line)
+            # Parse JSON and verify exact match
+            try:
+                pkg_data = json.loads(content)
+            except json.JSONDecodeError:
+                return None
 
-            return matched
-        except Exception:
-            return []
+            # Check if this is a real match by parsing the JSON structure
+            if not self._verify_package_match(pkg_data, lib_name, lib_version):
+                log_debug(f"False positive filtered: {lib_name}@{lib_version} in {repo}/{file_path}")
+                return None
+
+            # Find line numbers for matched content
+            lines = content.split('\n')
+            matched = []
+            for line_no, line in enumerate(lines, start=1):
+                # Look for exact package name as a JSON key
+                if f'"{lib_name}"' in line:
+                    matched.append((line_no, line))
+                elif lib_version in line:
+                    matched.append((line_no, line))
+
+            return matched[:10] if matched else [(1, f"{lib_name}@{lib_version}")]
+
+        except Exception as e:
+            log_debug(f"Error fetching {repo}/{file_path}: {e}")
+            return None
+
+    def _verify_package_match(
+        self, pkg_data: dict, lib_name: str, lib_version: str
+    ) -> bool:
+        """
+        Verify that the package.json or package-lock.json contains
+        an exact match for lib_name at lib_version.
+        """
+        # Check package-lock.json structure (v2/v3)
+        if 'packages' in pkg_data:
+            for pkg_path, pkg_info in pkg_data.get('packages', {}).items():
+                if pkg_info.get('name') == lib_name:
+                    if pkg_info.get('version') == lib_version:
+                        return True
+                # Also check nested node_modules path
+                if pkg_path.endswith(f'node_modules/{lib_name}'):
+                    if pkg_info.get('version') == lib_version:
+                        return True
+
+        # Check package-lock.json v1 dependencies
+        if 'dependencies' in pkg_data:
+            if self._check_dependencies(pkg_data['dependencies'], lib_name, lib_version):
+                return True
+
+        # Check package.json dependencies
+        for dep_type in ['dependencies', 'devDependencies', 'peerDependencies', 'optionalDependencies']:
+            deps = pkg_data.get(dep_type, {})
+            if lib_name in deps:
+                version_spec = deps[lib_name]
+                # Exact version match or version in spec
+                if version_spec == lib_version or lib_version in version_spec:
+                    return True
+
+        return False
+
+    def _check_dependencies(
+        self, deps: dict, lib_name: str, lib_version: str
+    ) -> bool:
+        """Recursively check dependencies in package-lock.json v1 format."""
+        if lib_name in deps:
+            dep_info = deps[lib_name]
+            if isinstance(dep_info, dict):
+                if dep_info.get('version') == lib_version:
+                    return True
+                # Check nested dependencies
+                if 'dependencies' in dep_info:
+                    if self._check_dependencies(dep_info['dependencies'], lib_name, lib_version):
+                        return True
+
+        # Check all nested dependencies
+        for dep_name, dep_info in deps.items():
+            if isinstance(dep_info, dict) and 'dependencies' in dep_info:
+                if self._check_dependencies(dep_info['dependencies'], lib_name, lib_version):
+                    return True
+
+        return False
 
     async def search_library(
         self, lib_name: str, lib_version: str, index: int, total: int
@@ -93,6 +171,17 @@ class GitHubScanner:
                     if line:
                         try:
                             item = json.loads(line)
+
+                            # Verify the match by fetching and parsing the actual file
+                            matched_lines = await self._fetch_and_verify(
+                                item['repository'], item['file'],
+                                lib_name, lib_version
+                            )
+
+                            # Skip false positives (verification returned None)
+                            if matched_lines is None:
+                                continue
+
                             result = SearchResult(
                                 repository=item['repository'],
                                 file=item['file'],
@@ -101,14 +190,6 @@ class GitHubScanner:
                                 version=lib_version
                             )
                             results.append(result)
-
-                            # Extract matched lines from text_matches if available
-                            matched_lines = []
-                            text_matches = item.get('text_matches') or []
-                            for tm in text_matches:
-                                fragment = tm.get('fragment', '')
-                                if fragment:
-                                    matched_lines.append(fragment)
 
                             log_detection(
                                 lib_name, lib_version,

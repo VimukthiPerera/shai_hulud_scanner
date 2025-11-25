@@ -48,16 +48,29 @@ def log_detection(
     repo: str,
     file: str,
     url: str,
-    matched_lines: Optional[list[str]] = None
+    matched_lines: Optional[list[tuple[int, str]]] = None
 ):
+    """Log a detection. matched_lines is a list of (line_number, line_content) tuples."""
     print(f"{Colors.RED}{Colors.BOLD}[🚨 DETECTION]{Colors.NC} {lib}@{version}", file=sys.stderr)
     print(f"           Repository: {Colors.YELLOW}{repo}{Colors.NC}", file=sys.stderr)
     print(f"           File:       {file}", file=sys.stderr)
-    print(f"           URL:        {url}", file=sys.stderr)
+
+    # Add line number to URL if we have matched lines
+    display_url = url
+    if matched_lines and len(matched_lines) > 0:
+        first_line = matched_lines[0][0]
+        # GitHub URL format: add #L<line_number> anchor
+        display_url = f"{url}#L{first_line}"
+
+    print(f"           URL:        {display_url}", file=sys.stderr)
+
     if DEBUG and matched_lines:
         print(f"           {Colors.MAGENTA}Matched lines:{Colors.NC}", file=sys.stderr)
-        for line in matched_lines[:5]:  # Show up to 5 matched lines
-            print(f"             {Colors.DIM}{line.strip()}{Colors.NC}", file=sys.stderr)
+        for line_no, content in matched_lines[:5]:  # Show up to 5 matched lines
+            print(
+                f"             {Colors.CYAN}{line_no:>5}{Colors.NC}: {Colors.DIM}{content.strip()}{Colors.NC}",
+                file=sys.stderr
+            )
     print("", file=sys.stderr)
 
 
