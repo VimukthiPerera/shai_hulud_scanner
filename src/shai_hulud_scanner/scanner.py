@@ -307,8 +307,12 @@ class GitHubScanner:
 
                 if proc.returncode != 0:
                     error_msg = stderr.decode().strip()
-                    log_debug(f"API error: {error_msg}")
-                    if 'rate limit' in error_msg.lower():
+                    stdout_msg = stdout.decode().strip()
+                    # Check both stderr and stdout for error messages
+                    combined_error = f"{error_msg} {stdout_msg}".lower()
+                    log_debug(f"API error: {error_msg or stdout_msg}")
+                    # Check for various rate limit error patterns
+                    if 'rate limit' in combined_error or 'rate_limit' in combined_error or 'ratelimit' in combined_error:
                         print(
                             f"{Colors.YELLOW}[RATE LIMITED]{Colors.NC} "
                             f"{lib_key} - waiting 60s",
