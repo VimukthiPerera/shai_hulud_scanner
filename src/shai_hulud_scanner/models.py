@@ -1,6 +1,9 @@
 """Data models for scan results."""
 
-from dataclasses import dataclass, asdict
+from __future__ import annotations
+
+from dataclasses import dataclass, asdict, field
+from typing import Optional
 
 
 @dataclass
@@ -10,6 +13,10 @@ class SearchResult:
     url: str
     library: str
     version: str
+    line_number: Optional[int] = None
+
+    def to_dict(self) -> dict:
+        return asdict(self)
 
 
 @dataclass
@@ -17,6 +24,31 @@ class AffectedRepository:
     repository: str
     affected_libraries: list
     files_affected: list
+
+
+@dataclass
+class ScanState:
+    """Tracks scan progress for resume capability."""
+    organization: str
+    total_libraries: int
+    scanned_libraries: list  # List of "name@version" strings
+    detections: list  # List of SearchResult dicts
+    started_at: str
+    updated_at: str
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict) -> ScanState:
+        return cls(
+            organization=data['organization'],
+            total_libraries=data['total_libraries'],
+            scanned_libraries=data['scanned_libraries'],
+            detections=data['detections'],
+            started_at=data['started_at'],
+            updated_at=data['updated_at']
+        )
 
 
 @dataclass

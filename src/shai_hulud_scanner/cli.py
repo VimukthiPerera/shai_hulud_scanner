@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .models import ScanReport
-from .output import log_info, log_error, print_header, print_summary, set_debug
+from .output import log_info, log_error, log_warn, print_header, print_summary, set_debug
 from .scanner import GitHubScanner
 
 
@@ -44,6 +44,24 @@ def load_libraries(csv_path: str) -> list[tuple[str, str]]:
     return libraries
 
 
+def write_output(output_file: str, scanner: GitHubScanner, libraries_count: int):
+    """Write final output report."""
+    affected_repos = scanner.aggregate_results(scanner.results)
+
+    report = ScanReport(
+        scan_date=datetime.now(timezone.utc).isoformat(),
+        organization=scanner.org,
+        total_libraries_scanned=libraries_count,
+        affected_repositories=len(affected_repos),
+        results=[asdict(repo) for repo in affected_repos]
+    )
+
+    with open(output_file, 'w') as f:
+        json.dump(report.to_dict(), f, indent=2)
+
+    return report
+
+
 async def async_main(args: argparse.Namespace) -> int:
     """Async entry point."""
     if args.debug:
@@ -60,28 +78,56 @@ async def async_main(args: argparse.Namespace) -> int:
         log_error("No libraries found in CSV file")
         return 1
 
-    print_header(args.org, len(libraries), args.concurrency, args.output)
-
-    scanner = GitHubScanner(args.org, args.concurrency)
-    results = await scanner.scan_libraries(libraries)
-
-    log_info("Scan complete. Generating report...")
-
-    affected_repos = scanner.aggregate_results(results)
-
-    report = ScanReport(
-        scan_date=datetime.now(timezone.utc).isoformat(),
-        organization=args.org,
-        total_libraries_scanned=len(libraries),
-        affected_repositories=len(affected_repos),
-        results=[asdict(repo) for repo in affected_repos]
+    scanner = GitHubScanner(
+        args.org,
+        args.concurrency,
+        output_file=args.output
     )
 
-    with open(args.output, 'w') as f:
-        json.dump(report.to_dict(), f, indent=2)
+    # Check for existing state to resume
+    resumed = False
+    if not args.fresh:
+        state = scanner.load_state()
+        if state:
+            if state.organization != args.org:
+                log_warn(f"State file is for different org ({state.organization}), starting fresh")
+                scanner.clear_state()
+            else:
+                resumed = True
+                scanned = len(state.scanned_libraries)
+                total = state.total_libraries
+                log_info(f"Resuming previous scan: {scanned}/{total} libraries already scanned")
+                log_info(f"Found {len(state.detections)} detections so far")
+                # Write output file immediately with existing detections
+                if scanner.results:
+                    write_output(args.output, scanner, len(libraries))
 
-    log_info(f"Results written to: {args.output}")
-    print_summary(report, scanner.detection_count)
+    print_header(args.org, len(libraries), args.concurrency, args.output)
+
+    if resumed and scanner.scan_state:
+        print(f"  Resuming from: {scanner.scan_state.started_at}", file=sys.stderr)
+        print("", file=sys.stderr)
+
+    try:
+        await scanner.scan_libraries(libraries)
+
+        log_info("Scan complete. Generating report...")
+
+        report = write_output(args.output, scanner, len(libraries))
+
+        # Clear state file on successful completion
+        scanner.clear_state()
+
+        log_info(f"Results written to: {args.output}")
+        print_summary(report, scanner.detection_count)
+
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        print("", file=sys.stderr)  # Newline after ^C
+        log_warn("Scan interrupted. Progress saved - run again to resume.")
+        # Save state one more time to ensure we have latest
+        await scanner._save_state(len(libraries))
+        scanner._write_output(len(libraries))
+        return 130  # Standard exit code for SIGINT
 
     return 0
 
@@ -118,9 +164,19 @@ def main() -> int:
         action='store_true',
         help='Enable debug output (show matched lines)'
     )
+    parser.add_argument(
+        '--fresh',
+        action='store_true',
+        help='Start fresh scan, ignoring any saved state'
+    )
 
     args = parser.parse_args()
-    return asyncio.run(async_main(args))
+    try:
+        return asyncio.run(async_main(args))
+    except KeyboardInterrupt:
+        print("", file=sys.stderr)
+        log_warn("Scan interrupted.")
+        return 130
 
 
 if __name__ == '__main__':

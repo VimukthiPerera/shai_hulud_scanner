@@ -34,6 +34,7 @@ PYTHONPATH=src python -m shai_hulud_scanner -g <github-org> -f <libraries.csv>
 | `-c, --concurrency` | Number of parallel searches | 10 |
 | `-o, --output` | Output JSON file | scan-results.json |
 | `-d, --debug` | Show matched lines in output | Off |
+| `--fresh` | Start fresh, ignore saved state | Off |
 
 ### CSV Format
 
@@ -64,7 +65,7 @@ Results stream in real-time as detections are found:
   Output:          scan-results.json
 ════════════════════════════════════════════════════════════
 
-[SCAN] (1/9) Scanning: event-stream@3.3.6
+[SCAN] (1/9)  11.1% | Scanning: event-stream@3.3.6
 [🚨 DETECTION] event-stream@3.3.6
            Repository: my-org/web-app
            File:       package-lock.json
@@ -72,3 +73,18 @@ Results stream in real-time as detections are found:
 ```
 
 JSON output is saved to the specified file with full details.
+
+## Resume Support
+
+Scans can be interrupted (Ctrl+C) and resumed later. Progress is saved to `<output>.state`:
+
+```bash
+# Start a scan
+shai-hulud-scanner -g my-org -f compromised.csv -o results.json
+
+# If interrupted, run the same command to resume
+shai-hulud-scanner -g my-org -f compromised.csv -o results.json
+
+# To start fresh, ignoring saved state
+shai-hulud-scanner -g my-org -f compromised.csv -o results.json --fresh
+```

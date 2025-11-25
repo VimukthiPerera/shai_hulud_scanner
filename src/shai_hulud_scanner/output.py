@@ -33,8 +33,13 @@ def log_error(msg: str):
     print(f"{Colors.RED}[ERROR]{Colors.NC} {msg}", file=sys.stderr)
 
 
-def log_progress(msg: str):
-    print(f"{Colors.CYAN}[SCAN]{Colors.NC} {msg}", file=sys.stderr)
+def log_warn(msg: str):
+    print(f"{Colors.YELLOW}[WARN]{Colors.NC} {msg}", file=sys.stderr)
+
+
+def log_progress(index: int, total: int, msg: str):
+    pct = (index / total) * 100 if total > 0 else 0
+    print(f"{Colors.CYAN}[SCAN]{Colors.NC} ({index}/{total}) {pct:5.1f}% | {msg}", file=sys.stderr)
 
 
 def log_debug(msg: str):

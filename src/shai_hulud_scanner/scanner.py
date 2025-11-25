@@ -6,14 +6,24 @@ import asyncio
 import json
 import sys
 import base64
-from typing import Optional
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional, Callable
 
-from .models import SearchResult, AffectedRepository
+from dataclasses import asdict
+
+from .models import SearchResult, AffectedRepository, ScanState, ScanReport
 from .output import Colors, log_progress, log_detection, log_debug
 
 
 class GitHubScanner:
-    def __init__(self, org: str, concurrency: int = 10):
+    def __init__(
+        self,
+        org: str,
+        concurrency: int = 10,
+        output_file: Optional[str] = None,
+        on_detection: Optional[Callable[[SearchResult], None]] = None
+    ):
         self.org = org
         self.concurrency = concurrency
         self.semaphore = asyncio.Semaphore(concurrency)
@@ -21,6 +31,91 @@ class GitHubScanner:
         self.results: list[SearchResult] = []
         self.results_lock = asyncio.Lock()
         self.detection_count = 0
+        self.output_file = output_file
+        self.on_detection = on_detection
+        self.scanned_libraries: set[str] = set()
+        self.scan_state: Optional[ScanState] = None
+        # Track seen detections to avoid duplicates on resume (repo:file:lib@version)
+        self.seen_detections: set[str] = set()
+
+    def _get_state_file(self) -> str:
+        """Get the state file path based on output file."""
+        if self.output_file:
+            return f"{self.output_file}.state"
+        return "scan-results.json.state"
+
+    def _write_output(self, total_libraries: int):
+        """Write current results to output file."""
+        if not self.output_file:
+            return
+
+        affected_repos = self.aggregate_results(self.results)
+
+        report = ScanReport(
+            scan_date=datetime.now(timezone.utc).isoformat(),
+            organization=self.org,
+            total_libraries_scanned=total_libraries,
+            affected_repositories=len(affected_repos),
+            results=[asdict(repo) for repo in affected_repos]
+        )
+
+        with open(self.output_file, 'w') as f:
+            json.dump(report.to_dict(), f, indent=2)
+
+    async def _save_state(self, total_libraries: int):
+        """Save current scan state for resume capability."""
+        async with self.results_lock:
+            state = ScanState(
+                organization=self.org,
+                total_libraries=total_libraries,
+                scanned_libraries=list(self.scanned_libraries),
+                detections=[r.to_dict() for r in self.results],
+                started_at=self.scan_state.started_at if self.scan_state else datetime.now(timezone.utc).isoformat(),
+                updated_at=datetime.now(timezone.utc).isoformat()
+            )
+            self.scan_state = state
+
+            state_file = self._get_state_file()
+            with open(state_file, 'w') as f:
+                json.dump(state.to_dict(), f, indent=2)
+
+    def load_state(self) -> Optional[ScanState]:
+        """Load previous scan state if exists."""
+        state_file = self._get_state_file()
+        if Path(state_file).exists():
+            try:
+                with open(state_file, 'r') as f:
+                    data = json.load(f)
+                    state = ScanState.from_dict(data)
+                    # Restore state
+                    self.scanned_libraries = set(state.scanned_libraries)
+                    self.results = []
+                    self.seen_detections = set()
+                    for d in state.detections:
+                        result = SearchResult(
+                            repository=d['repository'],
+                            file=d['file'],
+                            url=d['url'],
+                            library=d['library'],
+                            version=d['version'],
+                            line_number=d.get('line_number')
+                        )
+                        self.results.append(result)
+                        # Build seen_detections set to prevent duplicates on resume
+                        detection_key = f"{d['repository']}:{d['file']}:{d['library']}@{d['version']}"
+                        self.seen_detections.add(detection_key)
+                    self.detection_count = len(self.results)
+                    self.scan_state = state
+                    return state
+            except (json.JSONDecodeError, KeyError) as e:
+                log_debug(f"Could not load state file: {e}")
+        return None
+
+    def clear_state(self):
+        """Remove state file after successful completion."""
+        state_file = self._get_state_file()
+        if Path(state_file).exists():
+            Path(state_file).unlink()
 
     async def _fetch_and_verify(
         self, repo: str, file_path: str, lib_name: str, lib_version: str
@@ -120,7 +215,7 @@ class GitHubScanner:
                         return True
 
         # Check all nested dependencies
-        for dep_name, dep_info in deps.items():
+        for _, dep_info in deps.items():
             if isinstance(dep_info, dict) and 'dependencies' in dep_info:
                 if self._check_dependencies(dep_info['dependencies'], lib_name, lib_version):
                     return True
@@ -131,8 +226,15 @@ class GitHubScanner:
         self, lib_name: str, lib_version: str, index: int, total: int
     ) -> list[SearchResult]:
         """Search for a specific library version in package files."""
+        lib_key = f"{lib_name}@{lib_version}"
+
+        # Skip if already scanned (for resume)
+        if lib_key in self.scanned_libraries:
+            log_debug(f"Skipping already scanned: {lib_key}")
+            return []
+
         async with self.semaphore:
-            log_progress(f"({index}/{total}) Scanning: {lib_name}@{lib_version}")
+            log_progress(index, total, f"Scanning: {lib_key}")
 
             search_query = (
                 f'"{lib_name}" "{lib_version}" org:{self.org} '
@@ -146,7 +248,7 @@ class GitHubScanner:
                     'gh', 'api', '-X', 'GET', 'search/code',
                     '--field', f'q={search_query}',
                     '--field', 'per_page=100',
-                    '--jq', '.items[] | {repository: .repository.full_name, file: .path, url: .html_url, text_matches: .text_matches}',
+                    '--jq', '.items[] | {repository: .repository.full_name, file: .path, url: .html_url}',
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE
                 )
@@ -159,7 +261,7 @@ class GitHubScanner:
                     if 'rate limit' in error_msg.lower():
                         print(
                             f"{Colors.YELLOW}[RATE LIMITED]{Colors.NC} "
-                            f"{lib_name}@{lib_version} - waiting 60s",
+                            f"{lib_key} - waiting 60s",
                             file=sys.stderr
                         )
                         await asyncio.sleep(60)
@@ -182,12 +284,21 @@ class GitHubScanner:
                             if matched_lines is None:
                                 continue
 
+                            # Check if we've already seen this detection (for resume)
+                            detection_key = f"{item['repository']}:{item['file']}:{lib_name}@{lib_version}"
+                            if detection_key in self.seen_detections:
+                                log_debug(f"Skipping duplicate detection: {detection_key}")
+                                continue
+
+                            first_line = matched_lines[0][0] if matched_lines else None
+
                             result = SearchResult(
                                 repository=item['repository'],
                                 file=item['file'],
                                 url=item['url'],
                                 library=lib_name,
-                                version=lib_version
+                                version=lib_version,
+                                line_number=first_line
                             )
                             results.append(result)
 
@@ -197,18 +308,35 @@ class GitHubScanner:
                                 matched_lines=matched_lines
                             )
 
+                            # Add to global results, save state, and write output immediately
                             async with self.results_lock:
+                                self.results.append(result)
                                 self.detection_count += 1
+                                self.seen_detections.add(detection_key)
+                                # Write output file immediately on each detection
+                                self._write_output(total)
+
+                            # Call detection callback if provided
+                            if self.on_detection:
+                                self.on_detection(result)
 
                         except json.JSONDecodeError:
                             continue
+
+                # Mark this library as scanned
+                async with self.results_lock:
+                    self.scanned_libraries.add(lib_key)
+
+                # Save state and output after each library
+                await self._save_state(total)
+                self._write_output(total)
 
                 await asyncio.sleep(self.rate_limit_delay)
                 return results
 
             except Exception as e:
                 print(
-                    f"{Colors.RED}[ERROR]{Colors.NC} Searching {lib_name}@{lib_version}: {e}",
+                    f"{Colors.RED}[ERROR]{Colors.NC} Searching {lib_key}: {e}",
                     file=sys.stderr
                 )
                 return []
@@ -219,13 +347,26 @@ class GitHubScanner:
         """Scan all libraries concurrently with real-time output."""
         total = len(libraries)
 
+        # Initialize scan state
+        if not self.scan_state:
+            self.scan_state = ScanState(
+                organization=self.org,
+                total_libraries=total,
+                scanned_libraries=[],
+                detections=[],
+                started_at=datetime.now(timezone.utc).isoformat(),
+                updated_at=datetime.now(timezone.utc).isoformat()
+            )
+
         tasks = [
             self.search_library(name, version, idx + 1, total)
             for idx, (name, version) in enumerate(libraries)
         ]
 
-        all_results = await asyncio.gather(*tasks)
-        return [r for results in all_results for r in results]
+        await asyncio.gather(*tasks)
+
+        # Return all results (including resumed ones)
+        return self.results
 
     def aggregate_results(
         self, results: list[SearchResult]
@@ -245,7 +386,8 @@ class GitHubScanner:
                 'library': r.library,
                 'version': r.version,
                 'file': r.file,
-                'url': r.url
+                'url': r.url,
+                'line_number': r.line_number
             }
 
             if lib_entry not in repos[r.repository].affected_libraries:
