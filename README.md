@@ -35,6 +35,9 @@ PYTHONPATH=src python -m shai_hulud_scanner -g <github-org> -f <libraries.csv>
 | `-o, --output` | Output JSON file | scan-results.json |
 | `-d, --debug` | Show matched lines in output | Off |
 | `--fresh` | Start fresh, ignore saved state | Off |
+| `--scan-branches` | Scan all active branches (not just default) | Off |
+| `--branch-age` | Only scan branches with commits in last N days | 30 |
+| `--branches-file` | JSON file to save/load discovered branches | `<output>.branches.json` |
 
 ### CSV Format
 
@@ -88,3 +91,26 @@ shai-hulud-scanner -g my-org -f compromised.csv -o results.json
 # To start fresh, ignoring saved state
 shai-hulud-scanner -g my-org -f compromised.csv -o results.json --fresh
 ```
+
+## Branch Scanning Mode
+
+By default, the scanner uses GitHub's Code Search API which only searches the default branch. To scan all active branches:
+
+```bash
+# Scan all branches with commits in the last 30 days
+shai-hulud-scanner -g my-org -f compromised.csv --scan-branches
+
+# Scan branches with commits in the last 7 days
+shai-hulud-scanner -g my-org -f compromised.csv --scan-branches --branch-age 7
+
+# Use a specific branches file
+shai-hulud-scanner -g my-org -f compromised.csv --scan-branches --branches-file branches.json
+```
+
+Branch scanning works in two phases:
+1. **Discovery**: Lists all repos and their active branches, saves to `<output>.branches.json`
+2. **Scanning**: Fetches `package.json` and `package-lock.json` from each branch and checks for compromised packages
+
+The branches file can be reused across runs (unless `--fresh` is specified), saving API calls.
+
+**Note**: Branch scanning makes more API calls than code search mode and is slower, but provides complete coverage across all active branches.

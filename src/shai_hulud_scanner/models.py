@@ -14,6 +14,7 @@ class SearchResult:
     library: str
     version: str
     line_number: Optional[int] = None
+    branch: Optional[str] = None  # None means default branch
 
     def to_dict(self) -> dict:
         return asdict(self)

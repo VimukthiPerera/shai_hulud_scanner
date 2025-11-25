@@ -13,6 +13,8 @@ from pathlib import Path
 from .models import ScanReport
 from .output import log_info, log_error, log_warn, print_header, print_summary, set_debug
 from .scanner import GitHubScanner
+from .branches import BranchDiscovery, save_branches, load_branches
+from .branch_scanner import BranchScanner
 
 
 def check_prerequisites():
@@ -78,6 +80,95 @@ async def async_main(args: argparse.Namespace) -> int:
         log_error("No libraries found in CSV file")
         return 1
 
+    # Branch scanning mode
+    if args.scan_branches:
+        return await run_branch_scan(args, libraries)
+
+    # Default: code search mode
+    return await run_code_search_scan(args, libraries)
+
+
+async def run_branch_scan(args: argparse.Namespace, libraries: list[tuple[str, str]]) -> int:
+    """Run branch-based scanning."""
+    branches_file = args.branches_file or f"{args.output}.branches.json"
+
+    # Phase 1: Discover branches (or load from file)
+    discovery = None
+    if not args.fresh and Path(branches_file).exists():
+        discovery = load_branches(branches_file)
+        if discovery:
+            if discovery.organization != args.org:
+                log_warn(f"Branches file is for different org ({discovery.organization}), re-discovering")
+                discovery = None
+            else:
+                log_info(f"Loaded {discovery.total_branches} branches from {discovery.total_repos} repos")
+
+    if not discovery:
+        log_info("Discovering active branches...")
+        discoverer = BranchDiscovery(args.org, args.branch_age, args.concurrency)
+        discovery = await discoverer.discover()
+        save_branches(discovery, branches_file)
+        log_info(f"Found {discovery.total_branches} active branches in {discovery.total_repos} repos")
+
+    if discovery.total_branches == 0:
+        log_warn("No active branches found to scan")
+        return 0
+
+    # Phase 2: Scan branches
+    scanner = BranchScanner(
+        args.org,
+        args.concurrency,
+        output_file=args.output
+    )
+
+    # Check for existing state to resume
+    resumed = False
+    if not args.fresh:
+        state = scanner.load_state()
+        if state:
+            if state.organization != args.org:
+                log_warn(f"State file is for different org, starting fresh")
+                scanner.clear_state()
+            else:
+                resumed = True
+                scanned = len(state.scanned_libraries)
+                total = state.total_libraries
+                log_info(f"Resuming: {scanned}/{total} branches already scanned")
+                log_info(f"Found {len(state.detections)} detections so far")
+                if scanner.results:
+                    scanner._write_output(discovery.total_branches)
+
+    print_header_branches(args.org, len(libraries), discovery.total_branches, args.concurrency, args.output)
+
+    if resumed and scanner.scan_state:
+        print(f"  Resuming from: {scanner.scan_state.started_at}", file=sys.stderr)
+        print("", file=sys.stderr)
+
+    try:
+        await scanner.scan_branches(discovery, libraries)
+
+        log_info("Scan complete. Generating report...")
+
+        scanner._write_output(discovery.total_branches)
+        scanner.clear_state()
+
+        log_info(f"Results written to: {args.output}")
+
+        # Print summary
+        print_summary_branches(scanner, discovery.total_branches)
+
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        print("", file=sys.stderr)
+        log_warn("Scan interrupted. Progress saved - run again to resume.")
+        await scanner._save_state(discovery.total_branches)
+        scanner._write_output(discovery.total_branches)
+        return 130
+
+    return 0
+
+
+async def run_code_search_scan(args: argparse.Namespace, libraries: list[tuple[str, str]]) -> int:
+    """Run code search based scanning (default mode)."""
     scanner = GitHubScanner(
         args.org,
         args.concurrency,
@@ -132,6 +223,46 @@ async def async_main(args: argparse.Namespace) -> int:
     return 0
 
 
+def print_header_branches(org: str, total_libs: int, total_branches: int, concurrency: int, output_file: str):
+    """Print header for branch scanning mode."""
+    from .output import Colors
+    print("")
+    print(f"{Colors.BOLD}════════════════════════════════════════════════════════════{Colors.NC}")
+    print(f"{Colors.BOLD}  SHAI-HULUD SCANNER (Branch Mode){Colors.NC}")
+    print(f"{Colors.BOLD}════════════════════════════════════════════════════════════{Colors.NC}")
+    print(f"  Organization:    {Colors.CYAN}{org}{Colors.NC}")
+    print(f"  Libraries:       {Colors.CYAN}{total_libs}{Colors.NC}")
+    print(f"  Branches:        {Colors.CYAN}{total_branches}{Colors.NC}")
+    print(f"  Concurrency:     {Colors.CYAN}{concurrency}{Colors.NC}")
+    print(f"  Output:          {Colors.CYAN}{output_file}{Colors.NC}")
+    print(f"{Colors.BOLD}════════════════════════════════════════════════════════════{Colors.NC}")
+    print("")
+
+
+def print_summary_branches(scanner: BranchScanner, total_branches: int):
+    """Print summary for branch scanning mode."""
+    from .output import Colors
+    affected_repos = scanner.aggregate_results(scanner.results)
+
+    print("")
+    print(f"{Colors.BOLD}════════════════════════════════════════════════════════════{Colors.NC}")
+    print(f"{Colors.BOLD}  SCAN COMPLETE{Colors.NC}")
+    print(f"{Colors.BOLD}════════════════════════════════════════════════════════════{Colors.NC}")
+    print(f"  Branches Scanned:       {Colors.CYAN}{total_branches}{Colors.NC}")
+    print(f"  Total Detections:       {Colors.RED}{Colors.BOLD}{scanner.detection_count}{Colors.NC}")
+    print(f"  Affected Repositories:  {Colors.RED}{Colors.BOLD}{len(affected_repos)}{Colors.NC}")
+    print(f"{Colors.BOLD}════════════════════════════════════════════════════════════{Colors.NC}")
+
+    if affected_repos:
+        print("")
+        print(f"{Colors.BOLD}Affected Repositories:{Colors.NC}")
+        for repo in affected_repos:
+            lib_count = len(repo.affected_libraries)
+            print(f"  ⚠️  {repo.repository} - {lib_count} compromised package(s)")
+
+    print("")
+
+
 def main() -> int:
     """CLI entry point."""
     parser = argparse.ArgumentParser(
@@ -168,6 +299,21 @@ def main() -> int:
         '--fresh',
         action='store_true',
         help='Start fresh scan, ignoring any saved state'
+    )
+    parser.add_argument(
+        '--scan-branches',
+        action='store_true',
+        help='Scan all active branches (not just default branch)'
+    )
+    parser.add_argument(
+        '--branch-age',
+        type=int,
+        default=30,
+        help='Only scan branches with commits in last N days (default: 30)'
+    )
+    parser.add_argument(
+        '--branches-file',
+        help='JSON file to save/load discovered branches (default: <output>.branches.json)'
     )
 
     args = parser.parse_args()
